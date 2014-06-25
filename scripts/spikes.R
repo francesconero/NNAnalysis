@@ -49,7 +49,7 @@ clean_detector <- function(detect){
   ids = unique(detect$V1)
   out <- list()
   for(id in ids){
-    temp <- detect[ detect$V1==id, ,drop=FALSE]
+    temp <- detect[ detect$V1==id, ]
     out[[as.character(id)]] <- temp[,-1]
   }
   return(out)
@@ -64,20 +64,20 @@ process_voltmeter <- function(voltmeter){
   return(out)
 }
 
-process_spike_detector <- function(spikeDetector){
+process_spike_detector <- function(spikeDetector,c=10){
   out = list()
   for(spikes in names(spikeDetector)){
     print(spikes)
-    out[[spikes]] = as.integer(spikeDetector[[spikes]]*10)
+    out[[spikes]] = as.integer(spikeDetector[[spikes]]*c)
   }
   return(out)
 }
 
-trainize <- function(spikeList){
+trainize <- function(spikeList, res=0.1){
   out <- list()
   for(spike in names(spikeList)){
     print(spike)
-    out[[spike]] <- spike_train2(spikeList[[spike]],0.1)
+    out[[spike]] <- spike_train2(spikeList[[spike]],res)
   }
   return(out)
 }
@@ -140,20 +140,151 @@ examine_network <- function(spikes, volts, max_lag){
   out <- NULL
   for(A in names(spikes)){
     for(B in names(volts)){
-      if(A!=B){
-        cat(paste(A,B));
-        temp = opencl_corr(spikes[[A]],volts[[B]], max_lag, TRUE)
-        temp = inferConnection(temp)
-        temp[["num_spikes"]] <- length(spikes[[A]])
-        out[[paste(A,B)]] <- append(out,temp)
-      }
+        print(paste(A,B));
+        temp = OpenCLSpikeDVCorr(spikes[[A]],volts[[B]], max_lag, TRUE)
+        out[[paste(A,B)]] <- temp
     }
   }
   return(out)
 }
 
 examine_network_default <- function(){
-  return( examine_network(spikes=clean_spike_detector, volts=clean_voltmeter, 100))
+  return( examine_network(spikes, volts, 100))
 }
 
-neg <- function(x)-x
+setup_data <- function(raw_spikes, raw_volts){
+  raw_spikes = clean_detector(raw_spikes)
+  volts <<- clean_detector(raw_volts)
+  spikes <<- process_spike_detector(raw_spikes)
+}
+
+computeScores <- function(network){
+  out <- data.frame()
+  for(name in names(network)){
+    neurons <- strsplit(name, " ")[[1]]
+    out <- rbind(out, data.frame(A=neurons[1], B=neurons[2], E = myE(network[[name]]), I = myI(network[[name]])))
+  }
+  return(out)
+}
+
+myI <- function(x)return(abs(min(diff(x))-sd(diff(x))))
+myE <- function(x)return(abs(max(diff(x))-sd(diff(x))))
+
+SpikeSpikeCorrDefault <- function(A, B, max_lag=100){
+  return(SpikeSpikeCorr(spikes[[A]],spikes[[B]], max_lag=max_lag))
+}
+
+SpikeSpikeCorr <- function(A, B, max_lag=100, delay=0, plot=FALSE){
+  deltaT <- min(B[length(B)], A[length(A)])
+  out <- OpenCLSpikeSpikeCorr(A,B, max_lag=max_lag)/deltaT
+  out[seq_len(delay)] = mean(out[-(seq_len(delay))])
+  if(plot){
+    plot(out, type='h')
+    abline(h=AvgTrainRate(A)*AvgTrainRate(B), col="red")
+    abline(h=mean(out), col="blue")
+  }
+  return(out)
+}
+
+SpikeDVCorr <- function(A, B, max_lag=100){
+  return(OpenCLSpikeDVCorr(A,B, max_lag=max_lag, wait_=TRUE))
+}
+
+SpikeDVCorrDefault <- function(A, B, max_lag=100){
+  return(SpikeDVCorr(spikes[[A]], spikes[[B]], max_lag=max_lag))
+}
+
+grubbs.flag <- function(x, sig.level=0.05) {
+  outliers <- NULL
+  test <- x
+  grubbs.result <- grubbs.test(test)
+  pv <- grubbs.result$p.value
+  while(pv <= sig.level) {
+    outliers <- c(outliers,grubbs.result$possible.outliers)
+    test <- x[!x %in% outliers]
+    if(length(test)==0){
+      break
+    }
+    grubbs.result <- grubbs.test(test)
+    pv <- grubbs.result$p.value
+  }
+  return(x %in% outliers)
+}
+
+DetectMostLikelyLagBetweenTrainsDefault <- function(trainA, trainB){
+  return(DetectMostLikelyLagBetweenTrains(spikes[[trainA]], spikes[[trainB]]))
+}
+
+DetectMostLikelyLagBetweenTrains <- function(trainA, trainB, sig.level=0.01, plot=FALSE, delay=0){
+  corr <- SpikeSpikeCorr(trainA, trainB, delay=delay)
+  outliers <- grubbs.flag(corr, sig.level=sig.level)
+  if(plot){
+    PlotOutliers(corr, outliers)
+  }
+  indexes <- which(outliers==TRUE)
+  if(length(indexes) > 0){
+    return(indexes-1)
+  } else {
+    return(-1)
+  }
+}
+
+PlotOutliers <- function(data, outliers){
+  plot(data, type='l')
+  lines(which(outliers), data[outliers], type='p', col="red")
+}
+
+FilterTrainDefault <- function(trainToFilter, filterTrain, lag){
+  return(FilterTrain(spikes[[trainToFilter]],
+                     spikes[[filterTrain]],
+                     lag=lag))
+}
+
+FilterTrain <- function(trainToFilter, filterTrain, lag){
+  filterTrain = filterTrain - lag
+  return(setdiff(trainToFilter, filterTrain))
+}
+
+PurgeTrain <- function(trainToFilter, filterTrain, sig.level=0.05, plot=FALSE, delay=0, forward){
+  
+  if(forward){
+    parent = trainToFilter
+    child = filterTrain
+  } else {
+    parent = filterTrain
+    child = trainToFilter
+  }
+  
+  lags <- DetectMostLikelyLagBetweenTrains(parent, child, sig.level=sig.level, delay=delay)
+  out <- trainToFilter
+  
+  if(plot){
+      plot(SpikeSpikeCorr(parent, child), type='l')
+  }
+  
+  for(lag in lags){
+    if(!forward){
+      lag = -lag
+    }
+    out <- FilterTrain(out, filterTrain, lag)
+  }
+  
+  if(plot){
+    if(forward){
+      lines(SpikeSpikeCorr(out, child), type='l', col="red")
+    } else {
+      lines(SpikeSpikeCorr(parent, out), type='l', col="red")
+    }
+  }
+  
+  cat("removed: ")
+  cat(length(trainToFilter)-length(out))
+  cat(" spikes (")
+  cat(((length(trainToFilter)-length(out))/length(trainToFilter))*100)
+  cat(" % of total)")
+  return(out)
+}
+
+AvgTrainRate <- function(train){
+  return(length(train)/train[length(train)])
+}
